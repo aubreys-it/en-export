@@ -100,8 +100,6 @@ jobs:
       #        -acrServer $env:ACR_SERVER `
       #        -ingress "internal"
       
-      
-      
       - name: Update image via ARM PATCH (Az REST)
         uses: azure/powershell@v1
         with:
@@ -109,13 +107,15 @@ jobs:
           inlineScript: |
             if (-not $env:IMAGE) { throw "IMAGE is not set." }
 
-            $sub = (Get-AzContext).Subscription.Id
+            $sub  = (Get-AzContext).Subscription.Id
             $path = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP"
+            $api  = "2023-05-01"   # stable API version for Container Apps RM
+            $uri  = "https://management.azure.com$path?api-version=$api"
 
             # Container name from your aca-app.json ("main")
             $containerName = "main"
 
-            # Minimal JSON Merge Patch: only update the container image
+            # Minimal JSON Merge Patch body
             $body = @{
               properties = @{
                 template = @{
@@ -130,29 +130,35 @@ jobs:
             } | ConvertTo-Json -Depth 100
 
             Write-Host "PATCHing Container App with image $($env:IMAGE)"
-            # IMPORTANT: pass -ApiVersion so ARM doesn't return MissingApiVersionParameter
-            $resp = Invoke-AzRest -Method PATCH -Path $path -ApiVersion "2023-05-01" -Payload $body
-            if ($resp.StatusCode -notin 200,201,202) {
+            # Use Invoke-AzRestMethod with -Uri (includes ?api-version=)
+            $resp = Invoke-AzRestMethod -Method PATCH -Uri $uri -Payload $body -ContentType 'application/json'
+
+            # Basic status validation (200/201/202 are success for PATCH)
+            if ($null -eq $resp.StatusCode -or ($resp.StatusCode -notin 200,201,202)) {
               throw "Failed to PATCH Container App: $($resp.StatusCode) $($resp.Content)"
             }
-
-
 
       - name: Wait for revision to become Ready
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
           inlineScript: |
-            $sub = (Get-AzContext).Subscription.Id
-            $rid = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP?api-version=2023-05-01"
+            $sub  = (Get-AzContext).Subscription.Id
+            $path = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP"
+            $api  = "2023-05-01"
+            $uri  = "https://management.azure.com$path?api-version=$api"
 
-            $deadline = (Get-Date).AddMinutes(10)  # adjust if your image is big
+            $deadline = (Get-Date).AddMinutes(10)  # adjust for very large images
             do {
               Start-Sleep -Seconds 10
-              $app = (Invoke-AzRest -Method GET -Path $rid).Content | ConvertFrom-Json
-              $rev = $app.properties.latestRevisionName
-              $activeRevisions = $app.properties.revisions | Where-Object { $_.name -eq $rev }
-              $state = $activeRevisions.properties.active ? $activeRevisions.properties.provisioningState : "Provisioning"
+              $get = Invoke-AzRestMethod -Method GET -Uri $uri
+              $app = $get.Content | ConvertFrom-Json
+
+              $rev   = $app.properties.latestRevisionName
+              $activeRev = $app.properties.revisions | Where-Object { $_.name -eq $rev }
+              $state = $activeRev.properties.provisioningState
+
               Write-Host "Latest Revision: $rev  State: $state"
-              if ((Get-Date) -gt $deadline) { throw "Timeout waiting for revision to become Ready." }
+              if ((Get-Date) -gt $deadline) { throw "Timeout waiting for the new revision to become Ready." }
             } while ($state -ne "Succeeded")
+
