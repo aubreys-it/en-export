@@ -64,7 +64,7 @@ jobs:
             "IMAGE=$image" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "ACR_SERVER=$loginServer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       
-      - name: Update image via ARM PATCH (token + Invoke-RestMethod w/ audience fallback)
+      - name: Update image via ARM PATCH (token + Invoke-RestMethod, environment-aware)
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
@@ -75,19 +75,68 @@ jobs:
             if (-not $env:RG)    { throw "RG is not set." }
             if (-not $env:APP)   { throw "APP is not set." }
 
-            # Ensure the right subscription context
-            $sub = (Get-AzContext).Subscription.Id
+            # Ensure subscription context
+            $ctx = Get-AzContext
+            $sub = $ctx.Subscription.Id
             if ([string]::IsNullOrWhiteSpace($sub)) { $sub = $env:AZURE_SUBSCRIPTION_ID }
-            if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available in the Az context." }
+            if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available." }
             Select-AzSubscription -SubscriptionId $sub | Out-Null
+
+            # ARM base (public cloud example -> management.azure.com)
+            $armBase = (Get-AzEnvironment -Name $ctx.Environment.Name).ResourceManagerUrl.TrimEnd('/')
 
             $apiVersion   = "2023-05-01"
             $resourcePath = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
 
-            # Build URI safely
-            $ub = [System.UriBuilder]::new("https://management.azure.com$resourcePath")
-      
-      
+            # Build URI
+            $ub = [System.UriBuilder]::new("$armBase$resourcePath")
+            $ub.Query = "api-version=$apiVersion"
+            $uri = $ub.Uri.AbsoluteUri
+
+            # Read app to get its location (required by PATCH schema)
+            $appGetToken = (Get-AzAccessToken -ResourceUrl $armBase).Token
+            $appHeaders  = @{ "Authorization" = "Bearer $appGetToken" }
+            $appDoc      = Invoke-RestMethod -Method GET -Uri $uri -Headers $appHeaders -ErrorAction Stop
+            $location    = $appDoc.location
+            if ([string]::IsNullOrWhiteSpace($location)) { throw "Could not read app location; PATCH requires 'location'." }
+
+            Write-Host "ARM Base: $armBase"
+            Write-Host "SUB     : $sub"
+            Write-Host "URI     : $uri"
+            Write-Host "PATCHing image: $($env:IMAGE) with location: $location"
+
+            $containerName = "main"   # from your aca-app.json
+
+            # *** IMPORTANT: include 'location' in the PATCH body ***
+            $body = @{
+              location   = $location
+              properties = @{
+                template = @{
+                  containers = @(
+                    @{ name = $containerName; image = $env:IMAGE }
+                  )
+                }
+              }
+            } | ConvertTo-Json -Depth 100
+
+            # Try current cloud audience, then fall back to core.windows.net if needed
+            function Invoke-ArmPatch {
+              param([string]$audienceBase)
+              $token = (Get-AzAccessToken -ResourceUrl $audienceBase).Token
+              $headers = @{ "Authorization" = "Bearer $token" }
+              try {
+                Invoke-RestMethod -Method PATCH -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
+                return $true
+              } catch {
+                Write-Warning ("PATCH failed (" + $audienceBase + "): " + $_.Exception.Message)
+                return $false
+              }
+            }
+
+            $ok = Invoke-ArmPatch -audienceBase $armBase
+            if (-not $ok) { $ok = Invoke-ArmPatch -audienceBase "https://management.core.windows.net/" }
+            if (-not $ok) { throw "PATCH failed with both ARM audiences." }
+
       - name: Wait for image to be applied and app to become Ready (Azure CLI)
         shell: bash
         env:
