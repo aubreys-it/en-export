@@ -87,7 +87,6 @@ jobs:
             # Build URI safely
             $ub = [System.UriBuilder]::new("https://management.azure.com$resourcePath")
       
-      
       - name: Wait for revision to become Ready
         uses: azure/powershell@v1
         with:
@@ -98,54 +97,44 @@ jobs:
             if (-not $env:RG)  { throw "RG is not set." }
             if (-not $env:APP) { throw "APP is not set." }
 
-            # Ensure the right subscription context (azure/login@v2 + enable-AzPSSession should have set this)
+            # Ensure subscription context is set by azure/login@v2
             $sub = (Get-AzContext).Subscription.Id
             if ([string]::IsNullOrWhiteSpace($sub)) { $sub = $env:AZURE_SUBSCRIPTION_ID }
             if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available in the Az context." }
             Select-AzSubscription -SubscriptionId $sub | Out-Null
 
-            $apiVersion   = "2023-05-01"
-            $resourcePath = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
+            $apiVersion = "2023-05-01"
+            $appPath    = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
 
-            # Build URI once
-            $ub = [System.UriBuilder]::new("https://management.azure.com$resourcePath")
-            $ub.Query = "api-version=$apiVersion"
-            $uri = $ub.Uri.AbsoluteUri
-
+            # Helper to GET via Az REST (no manual token)
             function Get-ArmJson {
-              param([string]$audience)
-              try {
-                $token = (Get-AzAccessToken -ResourceUrl $audience).Token
-                if ([string]::IsNullOrWhiteSpace($token)) { throw "No token for $audience" }
-                $headers = @{ "Authorization" = "Bearer $token" }
-                return Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
-              } catch {
-                $msg = $_.Exception.Response | ForEach-Object {
-                  try { ($_ | Get-Content -Raw) } catch { $_.ToString() }
-                }
-                Write-Warning "GET against $audience failed. Server said: $msg"
-                return $null
-              }
+              param([string]$path)
+              ($resp = Invoke-AzRestMethod -Method GET -Path $path -ApiVersion $apiVersion).Content | ConvertFrom-Json
             }
 
-            # First attempt with management.azure.com, then fall back to management.core.windows.net
-            $get = Get-ArmJson "https://management.azure.com/"
-            if ($null -eq $get) { $get = Get-ArmJson "https://management.core.windows.net/" }
-            if ($null -eq $get) { throw "GET failed for both ARM audiences." }
+            # Get latest revision name from the app
+            $app = Get-ArmJson $appPath
+            if (-not $app.properties) { throw "GET app returned no properties; cannot read latestRevisionName." }
 
-            $deadline = (Get-Date).AddMinutes(10)  # increase if your image is very large
+            $revName = $app.properties.latestRevisionName
+            if ([string]::IsNullOrWhiteSpace($revName)) { throw "latestRevisionName is empty on the app." }
+            Write-Host "Latest revision reported by app: $revName"
+
+            $revPath = "$appPath/revisions/$revName"
+
+            $deadline = (Get-Date).AddMinutes(10)   # increase if your image is large
             do {
               Start-Sleep -Seconds 10
-              $get = Get-ArmJson "https://management.azure.com/"
-              if ($null -eq $get) { $get = Get-ArmJson "https://management.core.windows.net/" }
-              if ($null -eq $get) { throw "GET failed for both ARM audiences during polling." }
 
-              $rev   = $get.properties.latestRevisionName
-              $activeRev = $get.properties.revisions | Where-Object { $_.name -eq $rev }
-              $state = $activeRev.properties.provisioningState
+              # Get the specific revision resource and read provisioningState
+              $rev = Get-ArmJson $revPath
+              if (-not $rev.properties) { throw "GET revision returned no properties." }
 
-              Write-Host "Latest Revision: $rev  State: $state"
+              $state = $rev.properties.provisioningState
+              Write-Host "Revision: $revName  State: $state"
+
               if ((Get-Date) -gt $deadline) { throw "Timeout waiting for the new revision to become Ready." }
             } while ($state -ne "Succeeded")
+
 
 
