@@ -174,7 +174,7 @@ jobs:
             RUNSTATE=$(echo "$REV_JSON" | jq -r '.properties.runningState // empty')
             echo "📈 Revision $TARGET_REV ($i/$MAX_TRIES): provisioning=$PROV | health=$HEALTH | runningState=$RUNSTATE"
 
-            if [[ "$PROV" == "Succeeded" && "$HEALTH" == "Healthy" && "$RUNSTATE" =~ ^(Running|RunningAtMaxScale)$ ]]; then
+            if [[ "$PROV" == "Provisioned" && "$HEALTH" == "Healthy" && "$RUNSTATE" =~ ^(Running|RunningAtMaxScale)$ ]]; then
               echo "✅ Deployment succeeded: $TARGET_REV is Healthy and running."
               exit 0
             fi
