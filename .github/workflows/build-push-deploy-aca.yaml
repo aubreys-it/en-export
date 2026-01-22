@@ -1,186 +1,192 @@
 
-name: build-push-deploy-aca (Az)
+name: Build, Push & Deploy to Azure Container Apps
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  id-token: write       # required for azure/login OIDC
+  contents: read
+
+concurrency:
+  group: aca-enexport
+  cancel-in-progress: false
 
 env:
+  # ----- Azure resource identifiers (update if needed) -----
   RG: rg-en-export
-  ENV: enexport-aca-env
   APP: enexport-app
-  ACR_NAME: enexportacr123
+  ACR_NAME: enexportacr123                  # ACR resource name (no domain)
+  ACR_REGISTRY: enexportacr123.azurecr.io   # ACR login server (domain)
+  IMAGE_NAME: en-export-func                 # repo name in ACR
+  # ---------------------------------------------------------
+  # Build tag format: UTC timestamp (e.g., 20260122-2016)
+  TZ: UTC
 
 jobs:
-  build-push-deploy:
+  deploy:
     runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write      # required for OIDC
-      contents: read
-      env:
-        APP: enexport-app
-        RG: rg-en-export
-        IMAGE: enexportacr123.azurecr.io/en-export-func:${{ steps.meta.outputs.tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Login to Azure using OIDC; enables Az cmdlets in subsequent steps
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          enable-AzPSSession: true   # prepares Az PowerShell session for later steps
 
-      - name: Get ACR login server (Az PowerShell)
-        uses: azure/powershell@v1
-        with:
-          azPSVersion: "10.0"
-          inlineScript: |
-            $acr = Get-AzContainerRegistry -ResourceGroupName $env:RG -Name $env:ACR_NAME
-            "loginServer=$($acr.LoginServer)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Upgrade Azure CLI bits (optional but recommended)
+        shell: bash
+        run: |
+          set -euo pipefail
+          az upgrade -y || true
+          az extension add -n containerapp --upgrade -y || true
 
-      - name: ACR login for Docker (Az PowerShell)
-        uses: azure/powershell@v1
-        with:
-          azPSVersion: "10.0"
-          inlineScript: |
-            Connect-AzContainerRegistry -Name $env:ACR_NAME
-      # Connect-AzContainerRegistry sets Docker creds to push/pull. [1](https://dev.to/latzo/automating-azure-project-setup-with-powershell-and-github-actions-572f)
+      - name: Create build tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$(date -u +%Y%m%d-%H%M)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "IMAGE=${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG" >> "$GITHUB_ENV"
+          echo "Using tag: $TAG"
 
-      - name: Build & Push image (single-step version)
-        uses: azure/powershell@v1
-        with:
-          azPSVersion: "10.0"
-          inlineScript: |
-            $acr = Get-AzContainerRegistry -ResourceGroupName $env:RG -Name $env:ACR_NAME
-            $loginServer = $acr.LoginServer
-            $tag = (Get-Date -Format 'yyyyMMdd-HHmm')
-            $image = "$loginServer/en-export-func:$tag"
-            Write-Host "Building $image"
-            docker build -t "$image" .
-            docker push "$image"
-            "IMAGE=$image" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "ACR_SERVER=$loginServer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Docker build & push to ACR
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "🔧 Building image: $IMAGE"
+          docker build -t "$IMAGE" .
+          echo "🔐 Logging into ACR: $ACR_NAME"
+          az acr login -n "$ACR_NAME"
+          echo "⏫ Pushing image: $IMAGE"
+          docker push "$IMAGE"
 
+      # ---- New: wait for ACR to acknowledge the tag to avoid MANIFEST_UNKNOWN ----
       - name: Wait for ACR tag to exist
-              shell: bash
-              run: |
-                set -euo pipefail
-                TARGET="${IMAGE}"
-                REG_HOST="${TARGET%%/*}"
-                REMAIN="${TARGET#*/}"
-                REPO="${REMAIN%%:*}"
-                TAG="${REMAIN##*:}"
-                ACR="${REG_HOST%%.*}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="$IMAGE"                                   # e.g. enexportacr123.azurecr.io/en-export-func:20260122-2016
+          REG_HOST="${TARGET%%/*}"                          # enexportacr123.azurecr.io
+          REMAIN="${TARGET#*/}"                             # en-export-func:20260122-2016
+          REPO="${REMAIN%%:*}"                              # en-export-func
+          TAG="${REMAIN##*:}"                               # 20260122-2016
+          ACR="${REG_HOST%%.*}"                             # enexportacr123
+          echo "🔎 Waiting for ACR image to be available: ${REG_HOST}/${REPO}:${TAG}"
 
-                echo "🔎 Waiting for ACR image: ${REG_HOST}/${REPO}:${TAG}"
+          MAX_TRIES=60
+          SLEEP=5
+          for i in $(seq 1 $MAX_TRIES); do
+            if az acr manifest show -r "$ACR" -n "${REPO}:${TAG}" >/dev/null 2>&1; then
+              echo "✅ Tag present in ACR."
+              exit 0
+            fi
+            # Fallback for older CLIs using show-tags
+            if az acr repository show-tags -n "$ACR" --repository "$REPO" --query "contains(@, '${TAG}')" -o tsv 2>/dev/null | grep -qi true; then
+              echo "✅ Tag present (via show-tags)."
+              exit 0
+            fi
+            echo "⏳ Tag not present yet ($i/$MAX_TRIES). Sleeping ${SLEEP}s..."
+            sleep $SLEEP
+          done
 
-                MAX_TRIES=60; SLEEP=5; FOUND=""
-                for i in $(seq 1 $MAX_TRIES); do
-                  if az acr manifest show -r "$ACR" -n "${REPO}:${TAG}" >/dev/null 2>&1; then
-                    FOUND="yes"; echo "✅ Tag is present in ACR."; break
-                  fi
-                  if az acr repository show-tags -n "$ACR" --repository "$REPO" --query "contains(@, '${TAG}')" -o tsv 2>/dev/null | grep -qi true; then
-                    FOUND="yes"; echo "✅ Tag is present (via show-tags)."; break
-                  fi
-                  echo "⏳ Tag not present yet ($i/60). Sleeping $SLEEP s..."
-                  sleep $SLEEP
-                done
-                if [[ -z "$FOUND" ]]; then
-                  echo "❌ Timed out waiting for ${REPO}:${TAG} in ACR '${ACR}'."
-                  exit 1
-                fi
-            # (Why: avoids control-plane rejection with MANIFEST_UNKNOWN when the tag isn't there yet.)  
-            # Ref: Microsoft guidance to verify tag exists before pull/deploy.  
-            # Sources: MS docs on manifest-not-found & ACR tag listing. [1][2]
+          echo "❌ Timed out waiting for ${REPO}:${TAG} in ACR '${ACR}'."
+          exit 1
 
-            # 3) PATCH the Container App to use the new image
-            #    If you already PATCH elsewhere, REMOVE one of the duplicates and keep only one.
+      # ---- PATCH the Container App to use the new image (idempotent) ----
+      - name: Update image via ARM PATCH
+        shell: bash
+        env:
+          SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          az account set --subscription "$SUBSCRIPTION_ID"
 
-      
-      - name: Update image via ARM PATCH (idempotent)
-              shell: bash
-              env:
-                SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-              run: |
-                set -euo pipefail
-                az account set --subscription "$SUBSCRIPTION_ID"
+          API="2025-07-01"
+          APP_ID=$(az containerapp show -n "$APP" -g "$RG" --query id -o tsv)
+          URL="https://management.azure.com${APP_ID}?api-version=${API}"
 
-                API="2025-07-01"
-                APP_ID=$(az containerapp show -n "$APP" -g "$RG" --query id -o tsv)
-                URL="https://management.azure.com${APP_ID}?api-version=${API}"
-                BODY=$(jq -n --arg img "$IMAGE" --arg name "main" \
-                  '{properties:{template:{containers:[{name:$name,image:$img}]}}}')
-                az rest --method patch --url "$URL" \
-                  --headers "Content-Type=application/json" \
-                  --body "$BODY" --output none
-            # Ref: Container Apps Update supports JSON Merge PATCH and may return 202 for async. [3]
+          echo "🔁 Patching $APP to image: $IMAGE"
+          BODY=$(jq -n --arg img "$IMAGE" --arg name "main" \
+            '{properties:{template:{containers:[{name:$name,image:$img}]}}}')
+          az rest --method patch --url "$URL" \
+            --headers "Content-Type=application/json" \
+            --body "$BODY" --output none
 
+      # ---- Wait for new revision with this image to become Healthy ----
       - name: Wait for image to apply and revision to become Healthy
-              shell: bash
-              run: |
-                set -euo pipefail
+        shell: bash
+        run: |
+          set -euo pipefail
 
-                TARGET_IMG="$IMAGE"
-                echo "🔎 Target image: $TARGET_IMG"
+          TARGET_IMG="$IMAGE"
+          echo "🎯 Target image: $TARGET_IMG"
 
-                # Short template reflect check (now that tag exists)
-                for i in $(seq 1 18); do
-                  CUR_IMG=$(az containerapp show -n "$APP" -g "$RG" --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "")
-                  APP_STATE=$(az containerapp show -n "$APP" -g "$RG" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "")
-                  echo "Template check $i/18: image='$CUR_IMG' | app.provisioningState='$APP_STATE'"
+          # 1) Short wait for template to reflect the image (eventual consistency)
+          for i in $(seq 1 18); do
+            CUR_IMG=$(az containerapp show -n "$APP" -g "$RG" --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "")
+            APP_STATE=$(az containerapp show -n "$APP" -g "$RG" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "")
+            echo "🧩 Template check $i/18: image='$CUR_IMG' | app.provisioningState='$APP_STATE'"
 
-                  [[ "$CUR_IMG" == "$TARGET_IMG" ]] && break
-                  if [[ "$APP_STATE" == "Failed" ]]; then
-                    echo "⚠️ App provisioningState=Failed; deploymentErrors:"
-                    az containerapp show -n "$APP" -g "$RG" --query properties.deploymentErrors -o tsv || true
-                  fi
-                  sleep 5
-                done
+            [[ "$CUR_IMG" == "$TARGET_IMG" ]] && break
 
-                TARGET_REV=""
-                for i in $(seq 1 60); do
-                  TARGET_REV=$(az containerapp revision list -n "$APP" -g "$RG" \
-                    --query "[?properties.template.containers[0].image=='${TARGET_IMG}']|[0].name" -o tsv 2>/dev/null || echo "")
-                  [[ -n "$TARGET_REV" ]] && { echo "✅ Target revision: $TARGET_REV"; break; }
-                  echo "⏳ Waiting for target revision ($i/60)…"; sleep 5
-                done
+            if [[ "$APP_STATE" == "Failed" ]]; then
+              echo "⚠️ App provisioningState=Failed; deploymentErrors:"
+              az containerapp show -n "$APP" -g "$RG" --query properties.deploymentErrors -o tsv || true
+            fi
+            sleep 5
+          done
 
-                if [[ -z "$TARGET_REV" ]]; then
-                  echo "❌ No revision found with image '$TARGET_IMG'. Revisions snapshot:"
-                  az containerapp revision list -n "$APP" -g "$RG" -o table || true
-                  exit 1
-                fi
+          # 2) Find the target revision that references the new image
+          TARGET_REV=""
+          for i in $(seq 1 60); do
+            TARGET_REV=$(az containerapp revision list -n "$APP" -g "$RG" \
+              --query "[?properties.template.containers[0].image=='${TARGET_IMG}']|[0].name" -o tsv 2>/dev/null || echo "")
+            [[ -n "$TARGET_REV" ]] && { echo "✅ Target revision detected: $TARGET_REV"; break; }
+            echo "⏳ Waiting for target revision to appear ($i/60)…"
+            sleep 5
+          done
 
-                MAX_TRIES=90
-                for i in $(seq 1 $MAX_TRIES); do
-                  REV_JSON=$(az containerapp revision show -n "$APP" -g "$RG" --revision "$TARGET_REV" -o json 2>/dev/null || echo "{}")
-                  PROV=$(echo "$REV_JSON" | jq -r '.properties.provisioningState // empty')
-                  HEALTH=$(echo "$REV_JSON" | jq -r '.properties.healthState // empty')
-                  RUNSTATE=$(echo "$REV_JSON" | jq -r '.properties.runningState // empty')
-                  echo "Revision $TARGET_REV ($i/$MAX_TRIES): provisioning=$PROV | health=$HEALTH | runningState=$RUNSTATE"
+          if [[ -z "$TARGET_REV" ]]; then
+            echo "❌ No revision found with image '$TARGET_IMG'. Revisions snapshot:"
+            az containerapp revision list -n "$APP" -g "$RG" -o table || true
+            exit 1
+          fi
 
-                  if [[ "$PROV" == "Succeeded" && "$HEALTH" == "Healthy" && "$RUNSTATE" =~ ^(Running|RunningAtMaxScale)$ ]]; then
-                    echo "✅ Deployment succeeded: $TARGET_REV is Healthy."
-                    exit 0
-                  fi
+          # 3) Wait for revision to be Ready/Healthy/Running
+          MAX_TRIES=90
+          for i in $(seq 1 $MAX_TRIES); do
+            REV_JSON=$(az containerapp revision show -n "$APP" -g "$RG" --revision "$TARGET_REV" -o json 2>/dev/null || echo "{}")
+            PROV=$(echo "$REV_JSON" | jq -r '.properties.provisioningState // empty')
+            HEALTH=$(echo "$REV_JSON" | jq -r '.properties.healthState // empty')
+            RUNSTATE=$(echo "$REV_JSON" | jq -r '.properties.runningState // empty')
+            echo "📈 Revision $TARGET_REV ($i/$MAX_TRIES): provisioning=$PROV | health=$HEALTH | runningState=$RUNSTATE"
 
-                  if [[ "$PROV" == "Failed" || "$HEALTH" =~ ^(Failed|Degraded)$ ]]; then
-                    echo "❌ Revision indicates failure. System + console logs:"
-                    az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --type system --tail 200 --format text || true
-                    az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --tail 200 --format text || true
-                    exit 1
-                  fi
-                  sleep 5
-                done
+            if [[ "$PROV" == "Succeeded" && "$HEALTH" == "Healthy" && "$RUNSTATE" =~ ^(Running|RunningAtMaxScale)$ ]]; then
+              echo "✅ Deployment succeeded: $TARGET_REV is Healthy and running."
+              exit 0
+            fi
 
-                echo "❌ Timed out waiting for revision $TARGET_REV to become Healthy."
-                az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --type system --tail 200 --format text || true
-                az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --tail 200 --format text || true
-                exit 1
+            if [[ "$PROV" == "Failed" || "$HEALTH" =~ ^(Failed|Degraded)$ ]]; then
+              echo "❌ Revision indicates failure. Recent system + console logs:"
+              az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --type system --tail 200 --format text || true
+              az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --tail 200 --format text || true
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          echo "❌ Timed out waiting for revision $TARGET_REV to become Healthy."
+          echo "Dumping recent logs to help diagnose:"
+          az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --type system --tail 200 --format text || true
+          az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --tail 200 --format text || true
+          exit 1
