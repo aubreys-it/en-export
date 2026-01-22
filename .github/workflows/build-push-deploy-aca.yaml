@@ -100,28 +100,38 @@ jobs:
       #        -acrServer $env:ACR_SERVER `
       #        -ingress "internal"
       
-      - name: Update image via ARM PUT (Az REST)
+      
+      - name: Update image via ARM PATCH (Az REST)
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
           inlineScript: |
             if (-not $env:IMAGE) { throw "IMAGE is not set." }
+
             $sub = (Get-AzContext).Subscription.Id
             $rid = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP?api-version=2023-05-01"
 
-            # GET current app
-            $app = (Invoke-AzRest -Method GET -Path $rid).Content | ConvertFrom-Json
+            # Use the container name you defined in your template. You used "main" in aca-app.json.
+            $containerName = "main"
 
-            # (Optional) ensure registries and MI identity are present if your template doesn’t set them
-            # $app.identity.type = "SystemAssigned" # only if it wasn't set by template
+            # Minimal PATCH body: just set the image for the target container
+            $body = @{
+              properties = @{
+                template = @{
+                  containers = @(@{
+                    name  = $containerName
+                    image = $env:IMAGE
+                  })
+                }
+              }
+            } | ConvertTo-Json -Depth 100
 
-            # Update the image
-            $app.properties.template.containers[0].image = $env:IMAGE
-            $body = $app | ConvertTo-Json -Depth 100
+            Write-Host "PATCHing Container App with image $($env:IMAGE)"
+            $resp = Invoke-AzRest -Method PATCH -Path $rid -Payload $body
+            if ($resp.StatusCode -notin 200,201,202) {
+              throw "Failed to PATCH Container App: $($resp.StatusCode) $($resp.Content)"
+            }
 
-            Write-Host "Updating Container App with image $($env:IMAGE)"
-            $resp = Invoke-AzRest -Method PUT -Path $rid -Payload $body
-            if ($resp.StatusCode -notin 200,201,202) { throw "Failed to update app: $($resp.Content)" }
 
       - name: Wait for revision to become Ready
         uses: azure/powershell@v1
