@@ -111,7 +111,7 @@ public static class ReportExporter
         int offset = hash[^1] & 0x0F;
         int bin = ((hash[offset] & 0x7F) << 24) |
                   ((hash[offset + 1] & 0xFF) << 16) |
-                  ((hash[offset + 2] & 0FF) << 8) |
+                  ((hash[offset + 2] & 0xFF) << 8) |
                    (hash[offset + 3] & 0xFF);
         int code = bin % 1_000_000;
         return code.ToString("D6");
