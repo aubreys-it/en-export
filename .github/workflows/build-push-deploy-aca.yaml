@@ -87,8 +87,7 @@ jobs:
             # Build URI safely
             $ub = [System.UriBuilder]::new("https://management.azure.com$resourcePath")
       
-      
-      - name: Wait for revision to become Ready (same auth as PATCH)
+      - name: Wait for revision to become Ready (Az cmdlets, no tokens)
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
@@ -98,68 +97,49 @@ jobs:
             if (-not $env:RG)  { throw "RG is not set." }
             if (-not $env:APP) { throw "APP is not set." }
 
-            # Ensure subscription context (set by azure/login@v2)
+            # Ensure subscription context is set by azure/login@v2
             $ctx = Get-AzContext
             $sub = $ctx.Subscription.Id
             if ([string]::IsNullOrWhiteSpace($sub)) { $sub = $env:AZURE_SUBSCRIPTION_ID }
             if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available." }
             Select-AzSubscription -SubscriptionId $sub | Out-Null
 
-            # Use the same ARM base the PATCH step used (environment-aware)
-            $armBase = (Get-AzEnvironment -Name $ctx.Environment.Name).ResourceManagerUrl.TrimEnd('/')
-            $apiVersion = "2023-05-01"
-            $appPath    = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
+            $apiVersion = "2023-05-01"   # Container Apps ARM version
 
-            function New-ArmUri([string]$base, [string]$path, [string]$api) {
-              $ub = [System.UriBuilder]::new("$base$path")
-              $ub.Query = "api-version=$api"
-              $ub.Uri.AbsoluteUri
-            }
+            # 1) GET the container app and read latestRevisionName
+            $appRes = Get-AzResource `
+              -ResourceGroupName $env:RG `
+              -ResourceType "Microsoft.App/containerApps" `
+              -Name $env:APP `
+              -ApiVersion $apiVersion `
+              -ExpandProperties
 
-            function Get-ArmJson {
-              param([string]$audienceBase, [string]$url)
+            if (-not $appRes.Properties) { throw "App GET returned no Properties." }
+            $revName = $appRes.Properties.latestRevisionName
+            if ([string]::IsNullOrWhiteSpace($revName)) { throw "latestRevisionName is empty on the app." }
 
-              try {
-                $token = (Get-AzAccessToken -ResourceUrl $audienceBase).Token
-                if ([string]::IsNullOrWhiteSpace($token)) { throw "No token for $audienceBase" }
-                $headers = @{ "Authorization" = "Bearer $token" }
-                return Invoke-RestMethod -Method GET -Uri $url -Headers $headers -ErrorAction Stop
-              } catch {
-                Write-Warning ("GET failed (" + $audienceBase + "): " + $_.Exception.Message)
-                return $null
-              }
-            }
-
-            # 1) GET the app to read latestRevisionName
-            $appUri = New-ArmUri -base $armBase -path $appPath -api $apiVersion
-            $get = Get-ArmJson -audienceBase $armBase -url $appUri
-            if ($null -eq $get) {
-              # Fallback audience only if needed
-              $get = Get-ArmJson -audienceBase "https://management.core.windows.net/" -url $appUri
-            }
-            if ($null -eq $get) { throw "GET app failed for all ARM audiences." }
-
-            $revName = $get.properties.latestRevisionName
-            if ([string]::IsNullOrWhiteSpace($revName)) { throw "latestRevisionName is empty." }
             Write-Host "Latest revision: $revName"
 
             # 2) Poll the specific revision until provisioningState == Succeeded
-            $revPath = "$appPath/revisions/$revName"
-            $revUri  = New-ArmUri -base $armBase -path $revPath -api $apiVersion
+            $revId = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)/revisions/$revName"
+            $deadline = (Get-Date).AddMinutes(10)   # bump if your image is large
 
-            $deadline = (Get-Date).AddMinutes(10)  # bump if your image is large
             do {
               Start-Sleep -Seconds 10
-              $rev = Get-ArmJson -audienceBase $armBase -url $revUri
-              if ($null -eq $rev) {
-                $rev = Get-ArmJson -audienceBase "https://management.core.windows.net/" -url $revUri
-              }
-              if ($null -eq $rev) { throw "GET revision failed for all ARM audiences during polling." }
 
-              $state = $rev.properties.provisioningState
+              $revRes = Get-AzResource `
+                -ResourceId $revId `
+                -ApiVersion $apiVersion `
+                -ExpandProperties
+
+              if (-not $revRes.Properties) { throw "Revision GET returned no Properties." }
+
+              $state = $revRes.Properties.provisioningState
               Write-Host "Revision $revName  State: $state"
+
               if ((Get-Date) -gt $deadline) { throw "Timeout waiting for the new revision to become Ready." }
             } while ($state -ne "Succeeded")
+
 
 
 
