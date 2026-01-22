@@ -63,7 +63,11 @@ jobs:
         run: |
           set -euo pipefail
           echo "🔧 Building image: $IMAGE"
-          docker build -t "$IMAGE" .
+          docker build \
+                -f ./src/en-export-app/Dockerfile \
+                -t "$IMAGE" \
+                ./src/en-export-app
+
           echo "🔐 Logging into ACR: $ACR_NAME"
           az acr login -n "$ACR_NAME"
           echo "⏫ Pushing image: $IMAGE"
