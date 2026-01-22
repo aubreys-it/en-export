@@ -2,11 +2,12 @@
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
   "parameters": {
-    "envName":  { "type": "string" },
-    "appName":  { "type": "string" },
-    "image":    { "type": "string" },
+    "envName":   { "type": "string" },
+    "appName":   { "type": "string" },
+    "image":     { "type": "string" },
+    "acrServer": { "type": "string", "metadata": { "description": "e.g., enexportacr123.azurecr.io" } },
     "targetPort": { "type": "int", "defaultValue": 8080 },
-    "ingress":  { "type": "string", "defaultValue": "internal" }
+    "ingress":   { "type": "string", "defaultValue": "internal" }
   },
   "resources": [
     {
@@ -14,9 +15,13 @@
       "apiVersion": "2023-05-01",
       "name": "[parameters('appName')]",
       "location": "[resourceGroup().location]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
       "properties": {
         "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('envName'))]",
         "configuration": {
+          "activeRevisionsMode": "Single",
           "ingress": {
             "external": "[equals(parameters('ingress'),'external')]",
             "targetPort": "[parameters('targetPort')]"
@@ -25,7 +30,13 @@
             "enabled": true,
             "appId": "[parameters('appName')]",
             "appPort": "[parameters('targetPort')]"
-          }
+          },
+          "registries": [
+            {
+              "server": "[parameters('acrServer')]",
+              "identity": "system"
+            }
+          ]
         },
         "template": {
           "containers": [

@@ -1,0 +1,85 @@
+
+name: build-push-deploy-aca (Az)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  RG: rg-en-export
+  ENV: enexport-aca-env
+  APP: enexport-app
+  ACR_NAME: enexportacr123
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write      # required for OIDC
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Login to Azure using OIDC; enables Az cmdlets in subsequent steps
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true   # prepares Az PowerShell session for later steps
+
+      - name: Get ACR login server (Az PowerShell)
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "10.0"
+          inlineScript: |
+            $acr = Get-AzContainerRegistry -ResourceGroupName $env:RG -Name $env:ACR_NAME
+            "loginServer=$($acr.LoginServer)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: ACR login for Docker (Az PowerShell)
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "10.0"
+          inlineScript: |
+            Connect-AzContainerRegistry -Name $env:ACR_NAME
+      # Connect-AzContainerRegistry sets Docker creds to push/pull. [1](https://dev.to/latzo/automating-azure-project-setup-with-powershell-and-github-actions-572f)
+
+      - name: Build & Push image (Docker)
+        run: |
+          TAG=$(date +'%Y%m%d-%H%M')
+          IMAGE="${{ steps.get_acr_login_server.outputs.loginServer }}/en-export-func:${TAG}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+        id: build_push
+        env:
+          get_acr_login_server: ${{ steps.Get_ACR_login_server.outputs.loginServer }}
+
+      # (Optional) Ensure Dapr Cron component is present/up-to-date (scoped to $APP)
+      # Requires cron-dapr.yaml in repo; comment out if you manage this outside CI.
+      # - name: Set/Update Dapr Cron component (Az REST optional)
+      #   uses: azure/powershell@v1
+      #   with:
+      #     azPSVersion: "10.0"
+      #     inlineScript: |
+      #       # Example: use ARM template or Invoke-AzRest to put the dapr component.
+      #       # Dapr components are environment resources; 'scopes' should include $env:APP. [3](https://github.com/Azure/azure-cli/issues/25829)
+      #       Write-Host "Skipping cron component enforcement in this run."
+
+      - name: Update ACA app to new image (ARM + Az PowerShell)
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "10.0"
+          inlineScript: |
+            New-AzResourceGroupDeployment `
+              -ResourceGroupName $env:RG `
+              -TemplateFile ./aca-app.json `
+              -envName $env:ENV `
+              -appName $env:APP `
+              -image $env:IMAGE `
+              -ingress "internal"
