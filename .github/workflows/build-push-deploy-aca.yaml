@@ -100,22 +100,39 @@ jobs:
       #        -acrServer $env:ACR_SERVER `
       #        -ingress "internal"
       
+      
       - name: Update image via ARM PATCH (Az REST)
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
           inlineScript: |
             if (-not $env:IMAGE) { throw "IMAGE is not set." }
+            if (-not $env:RG)    { throw "RG is not set." }
+            if (-not $env:APP)   { throw "APP is not set." }
 
-            $sub  = (Get-AzContext).Subscription.Id
-            $path = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP"
-            $api  = "2023-05-01"   # stable API version for Container Apps RM
-            $uri  = "https://management.azure.com$path?api-version=$api"
+            # Make sure we have a subscription in context (azure/login@v2 with enable-AzPSSession should set this)
+            $sub = (Get-AzContext).Subscription.Id
+            if ([string]::IsNullOrWhiteSpace($sub)) {
+              # Fallback to pipeline secret if context wasn't set for some reason
+              $sub = $env:AZURE_SUBSCRIPTION_ID
+            }
+            if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available in the Az context." }
 
-            # Container name from your aca-app.json ("main")
+            # Build the full ARM URI safely
+            $resourcePath = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
+            $baseUri = "https://management.azure.com$resourcePath"
+            $apiVersion = "2023-05-01"
+
+            $ub = [System.UriBuilder]$baseUri
+            $ub.Query = "api-version=$apiVersion"
+            $uri = $ub.Uri.AbsoluteUri
+            Write-Host "PATCHing Container App with image $($env:IMAGE)"
+            Write-Host "Target URI: $uri"
+
+            # Container name from your aca-app.json
             $containerName = "main"
 
-            # Minimal JSON Merge Patch body
+            # Minimal JSON Merge Patch body: just update the image field
             $body = @{
               properties = @{
                 template = @{
@@ -129,14 +146,12 @@ jobs:
               }
             } | ConvertTo-Json -Depth 100
 
-            Write-Host "PATCHing Container App with image $($env:IMAGE)"
-            # Use Invoke-AzRestMethod with -Uri (includes ?api-version=)
+            # Perform the PATCH
             $resp = Invoke-AzRestMethod -Method PATCH -Uri $uri -Payload $body -ContentType 'application/json'
-
-            # Basic status validation (200/201/202 are success for PATCH)
             if ($null -eq $resp.StatusCode -or ($resp.StatusCode -notin 200,201,202)) {
               throw "Failed to PATCH Container App: $($resp.StatusCode) $($resp.Content)"
             }
+
 
       - name: Wait for revision to become Ready
         uses: azure/powershell@v1
