@@ -32,10 +32,7 @@
             "appPort": "[parameters('targetPort')]"
           },
           "registries": [
-            {
-              "server": "[parameters('acrServer')]",
-              "identity": "system"
-            }
+            { "server": "enexportacr123.azurecr.io", "identity": "system" }
           ]
         },
         "template": {

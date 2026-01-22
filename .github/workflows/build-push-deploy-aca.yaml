@@ -64,42 +64,6 @@ jobs:
             "IMAGE=$image" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "ACR_SERVER=$loginServer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       
-      #- name: Build & Push image (Docker)
-      #  run: |
-      #    TAG=$(date +'%Y%m%d-%H%M')
-      #    IMAGE="${{ steps.get_acr_login_server.outputs.loginServer }}/en-export-func:${TAG}"
-      #    docker build -t "$IMAGE" .
-      #    docker push "$IMAGE"
-      #    echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-      #  id: build_push
-      #  env:
-      #    get_acr_login_server: ${{ steps.Get_ACR_login_server.outputs.loginServer }}
-
-      # (Optional) Ensure Dapr Cron component is present/up-to-date (scoped to $APP)
-      # Requires cron-dapr.yaml in repo; comment out if you manage this outside CI.
-      # - name: Set/Update Dapr Cron component (Az REST optional)
-      #   uses: azure/powershell@v1
-      #   with:
-      #     azPSVersion: "10.0"
-      #     inlineScript: |
-      #       # Example: use ARM template or Invoke-AzRest to put the dapr component.
-      #       # Dapr components are environment resources; 'scopes' should include $env:APP. [3](https://github.com/Azure/azure-cli/issues/25829)
-      #       Write-Host "Skipping cron component enforcement in this run."
-
-      #- name: Update ACA app to new image (ARM + Az PowerShell)
-      #  uses: azure/powershell@v1
-      #  with:
-      #    azPSVersion: "10.0"
-      #    inlineScript: |
-      #      New-AzResourceGroupDeployment `
-      #        -ResourceGroupName $env:RG `
-      #        -TemplateFile ./aca-app.json `
-      #        -envName $env:ENV `
-      #        -appName $env:APP `
-      #        -image $env:IMAGE `
-      #        -acrServer $env:ACR_SERVER `
-      #        -ingress "internal"
-      
       
       - name: Update image via ARM PATCH (Az REST)
         uses: azure/powershell@v1
@@ -110,29 +74,25 @@ jobs:
             if (-not $env:RG)    { throw "RG is not set." }
             if (-not $env:APP)   { throw "APP is not set." }
 
-            # Make sure we have a subscription in context (azure/login@v2 with enable-AzPSSession should set this)
+            # Confirm subscription context (azure/login@v2 + enable-AzPSSession sets this)
             $sub = (Get-AzContext).Subscription.Id
-            if ([string]::IsNullOrWhiteSpace($sub)) {
-              # Fallback to pipeline secret if context wasn't set for some reason
-              $sub = $env:AZURE_SUBSCRIPTION_ID
-            }
+            if ([string]::IsNullOrWhiteSpace($sub)) { $sub = $env:AZURE_SUBSCRIPTION_ID }
             if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available in the Az context." }
 
-            # Build the full ARM URI safely
+            # Build ARM path + version (avoid hand-building Uri)
             $resourcePath = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
-            $baseUri = "https://management.azure.com$resourcePath"
-            $apiVersion = "2023-05-01"
+            $apiVersion   = "2023-05-01"
 
-            $ub = [System.UriBuilder]$baseUri
-            $ub.Query = "api-version=$apiVersion"
-            $uri = $ub.Uri.AbsoluteUri
+            # Debug: show what we're about to call
+            Write-Host "SUB: $sub"
+            Write-Host "PATH: $resourcePath"
+            Write-Host "API : $apiVersion"
             Write-Host "PATCHing Container App with image $($env:IMAGE)"
-            Write-Host "Target URI: $uri"
 
             # Container name from your aca-app.json
             $containerName = "main"
 
-            # Minimal JSON Merge Patch body: just update the image field
+            # Minimal JSON Merge Patch body: only update the image
             $body = @{
               properties = @{
                 template = @{
@@ -146,34 +106,40 @@ jobs:
               }
             } | ConvertTo-Json -Depth 100
 
-            # Perform the PATCH
-            $resp = Invoke-AzRestMethod -Method PATCH -Uri $uri -Payload $body -ContentType 'application/json'
+            # Perform the PATCH using -Path and -ApiVersion
+            $resp = Invoke-AzRestMethod -Method PATCH -Path $resourcePath -ApiVersion $apiVersion -Payload $body -ContentType 'application/json'
+
             if ($null -eq $resp.StatusCode -or ($resp.StatusCode -notin 200,201,202)) {
               throw "Failed to PATCH Container App: $($resp.StatusCode) $($resp.Content)"
             }
-
-
+      
       - name: Wait for revision to become Ready
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
           inlineScript: |
-            $sub  = (Get-AzContext).Subscription.Id
-            $path = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP"
-            $api  = "2023-05-01"
-            $uri  = "https://management.azure.com$path?api-version=$api"
+            if (-not $env:RG)  { throw "RG is not set." }
+            if (-not $env:APP) { throw "APP is not set." }
 
-            $deadline = (Get-Date).AddMinutes(10)  # adjust for very large images
+            $sub = (Get-AzContext).Subscription.Id
+            if ([string]::IsNullOrWhiteSpace($sub)) { $sub = $env:AZURE_SUBSCRIPTION_ID }
+            if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available in the Az context." }
+
+            $resourcePath = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
+            $apiVersion   = "2023-05-01"
+
+            $deadline = (Get-Date).AddMinutes(10)  # bump if your image is large
             do {
               Start-Sleep -Seconds 10
-              $get = Invoke-AzRestMethod -Method GET -Uri $uri
+              $get = Invoke-AzRestMethod -Method GET -Path $resourcePath -ApiVersion $apiVersion
               $app = $get.Content | ConvertFrom-Json
 
-              $rev   = $app.properties.latestRevisionName
+              $rev = $app.properties.latestRevisionName
               $activeRev = $app.properties.revisions | Where-Object { $_.name -eq $rev }
               $state = $activeRev.properties.provisioningState
 
               Write-Host "Latest Revision: $rev  State: $state"
               if ((Get-Date) -gt $deadline) { throw "Timeout waiting for the new revision to become Ready." }
             } while ($state -ne "Succeeded")
+
 
