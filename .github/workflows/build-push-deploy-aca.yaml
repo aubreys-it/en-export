@@ -87,7 +87,7 @@ jobs:
             # Build URI safely
             $ub = [System.UriBuilder]::new("https://management.azure.com$resourcePath")
       
-      - name: Wait for revision to become Ready (Az cmdlets, no tokens)
+      - name: Wait for revision to become Ready (same auth as PATCH + fallback to list)
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
@@ -97,50 +97,85 @@ jobs:
             if (-not $env:RG)  { throw "RG is not set." }
             if (-not $env:APP) { throw "APP is not set." }
 
-            # Ensure subscription context is set by azure/login@v2
+            # 1) Subscription & environment-aware ARM base (same as PATCH step)
             $ctx = Get-AzContext
             $sub = $ctx.Subscription.Id
             if ([string]::IsNullOrWhiteSpace($sub)) { $sub = $env:AZURE_SUBSCRIPTION_ID }
             if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available." }
             Select-AzSubscription -SubscriptionId $sub | Out-Null
 
-            $apiVersion = "2023-05-01"   # Container Apps ARM version
+            $armBase   = (Get-AzEnvironment -Name $ctx.Environment.Name).ResourceManagerUrl.TrimEnd('/')
+            $api       = "2023-05-01"
+            $appPath   = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
+            $listPath  = "$appPath/revisions"
 
-            # 1) GET the container app and read latestRevisionName
-            $appRes = Get-AzResource `
-              -ResourceGroupName $env:RG `
-              -ResourceType "Microsoft.App/containerApps" `
-              -Name $env:APP `
-              -ApiVersion $apiVersion `
-              -ExpandProperties
+            function New-ArmUri([string]$base, [string]$path, [string]$api) {
+              $ub = [System.UriBuilder]::new("$base$path")
+              $ub.Query = "api-version=$api"
+              $ub.Uri.AbsoluteUri
+            }
 
-            if (-not $appRes.Properties) { throw "App GET returned no Properties." }
-            $revName = $appRes.Properties.latestRevisionName
-            if ([string]::IsNullOrWhiteSpace($revName)) { throw "latestRevisionName is empty on the app." }
+            function Get-ArmJson {
+              param([string]$audienceBase, [string]$url)
+              try {
+                $token = (Get-AzAccessToken -ResourceUrl $audienceBase).Token
+                if ([string]::IsNullOrWhiteSpace($token)) { throw "No token for $audienceBase" }
+                $headers = @{ "Authorization" = "Bearer $token" }
+                return Invoke-RestMethod -Method GET -Uri $url -Headers $headers -ErrorAction Stop
+              } catch {
+                Write-Warning ("GET failed (" + $audienceBase + "): " + $_.Exception.Message)
+                return $null
+              }
+            }
 
-            Write-Host "Latest revision: $revName"
+            # Helper that tries current cloud ARM base then classic core.windows.net
+            function Get-ArmJsonWithFallback([string]$url) {
+              $res = Get-ArmJson -audienceBase $armBase -url $url
+              if ($null -eq $res) { $res = Get-ArmJson -audienceBase "https://management.core.windows.net/" -url $url }
+              return $res
+            }
 
-            # 2) Poll the specific revision until provisioningState == Succeeded
-            $revId = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)/revisions/$revName"
-            $deadline = (Get-Date).AddMinutes(10)   # bump if your image is large
+            # Small settle delay after PATCH helps in practice
+            Start-Sleep -Seconds 5
 
+            # 2) Try to read latestRevisionName from the app
+            $appUri = New-ArmUri -base $armBase -path $appPath -api $api
+            $app = Get-ArmJsonWithFallback $appUri
+            if ($null -eq $app) { throw "GET app failed for all ARM audiences." }
+
+            $revName = $app.properties.latestRevisionName
+
+            # 3) Fallback: if latestRevisionName is empty, list revisions and pick newest
+            if ([string]::IsNullOrWhiteSpace($revName)) {
+              Write-Host "latestRevisionName empty; falling back to revisions list…"
+              $listUri = New-ArmUri -base $armBase -path $listPath -api $api
+              $list = Get-ArmJsonWithFallback $listUri
+              if ($null -eq $list -or -not $list.value) { throw "Revisions list empty or unavailable." }
+
+              # Sort by createdTime descending (if present); otherwise keep order
+              $items = $list.value
+              if ($items[0].properties.PSObject.Properties.Name -contains "createdTime") {
+                $items = $items | Sort-Object { [datetime]$_.properties.createdTime } -Descending
+              }
+              $revName = $items[0].name
+              if ([string]::IsNullOrWhiteSpace($revName)) { throw "Unable to resolve latest revision name from list." }
+              Write-Host "Picked latest revision from list: $revName"
+            } else {
+              Write-Host "Latest revision reported by app: $revName"
+            }
+
+            # 4) Poll the specific revision until provisioningState == Succeeded
+            $revPath = "$appPath/revisions/$revName"
+            $revUri  = New-ArmUri -base $armBase -path $revPath -api $api
+
+            $deadline = (Get-Date).AddMinutes(10)  # increase if your image is big
             do {
               Start-Sleep -Seconds 10
+              $rev = Get-ArmJsonWithFallback $revUri
+              if ($null -eq $rev) { throw "GET revision failed for all ARM audiences during polling." }
 
-              $revRes = Get-AzResource `
-                -ResourceId $revId `
-                -ApiVersion $apiVersion `
-                -ExpandProperties
-
-              if (-not $revRes.Properties) { throw "Revision GET returned no Properties." }
-
-              $state = $revRes.Properties.provisioningState
+              $state = $rev.properties.provisioningState
               Write-Host "Revision $revName  State: $state"
 
               if ((Get-Date) -gt $deadline) { throw "Timeout waiting for the new revision to become Ready." }
             } while ($state -ne "Succeeded")
-
-
-
-
-
