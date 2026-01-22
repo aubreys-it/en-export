@@ -61,6 +61,7 @@ jobs:
             Write-Host "Building $image"
             docker build -t "$image" .
             docker push "$image"
+            "IMAGE=$image" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       
       #- name: Build & Push image (Docker)
       #  run: |
