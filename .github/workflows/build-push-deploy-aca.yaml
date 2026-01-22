@@ -101,6 +101,7 @@ jobs:
       #        -ingress "internal"
       
       
+      
       - name: Update image via ARM PATCH (Az REST)
         uses: azure/powershell@v1
         with:
@@ -109,28 +110,32 @@ jobs:
             if (-not $env:IMAGE) { throw "IMAGE is not set." }
 
             $sub = (Get-AzContext).Subscription.Id
-            $rid = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP?api-version=2023-05-01"
+            $path = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP"
 
-            # Use the container name you defined in your template. You used "main" in aca-app.json.
+            # Container name from your aca-app.json ("main")
             $containerName = "main"
 
-            # Minimal PATCH body: just set the image for the target container
+            # Minimal JSON Merge Patch: only update the container image
             $body = @{
               properties = @{
                 template = @{
-                  containers = @(@{
-                    name  = $containerName
-                    image = $env:IMAGE
-                  })
+                  containers = @(
+                    @{
+                      name  = $containerName
+                      image = $env:IMAGE
+                    }
+                  )
                 }
               }
             } | ConvertTo-Json -Depth 100
 
             Write-Host "PATCHing Container App with image $($env:IMAGE)"
-            $resp = Invoke-AzRest -Method PATCH -Path $rid -Payload $body
+            # IMPORTANT: pass -ApiVersion so ARM doesn't return MissingApiVersionParameter
+            $resp = Invoke-AzRest -Method PATCH -Path $path -ApiVersion "2023-05-01" -Payload $body
             if ($resp.StatusCode -notin 200,201,202) {
               throw "Failed to PATCH Container App: $($resp.StatusCode) $($resp.Content)"
             }
+
 
 
       - name: Wait for revision to become Ready
