@@ -64,9 +64,7 @@ jobs:
             "IMAGE=$image" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "ACR_SERVER=$loginServer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       
-      
-      
-      - name: Update image via ARM PATCH (token + Invoke-RestMethod)
+      - name: Update image via ARM PATCH (token + Invoke-RestMethod w/ audience fallback)
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
@@ -77,54 +75,17 @@ jobs:
             if (-not $env:RG)    { throw "RG is not set." }
             if (-not $env:APP)   { throw "APP is not set." }
 
-            # Ensure subscription context (azure/login@v2 sets this)
+            # Ensure the right subscription context
             $sub = (Get-AzContext).Subscription.Id
             if ([string]::IsNullOrWhiteSpace($sub)) { $sub = $env:AZURE_SUBSCRIPTION_ID }
             if ([string]::IsNullOrWhiteSpace($sub)) { throw "Subscription Id is not available in the Az context." }
+            Select-AzSubscription -SubscriptionId $sub | Out-Null
 
-            $apiVersion = "2023-05-01"  # stable API for Container Apps (RM)
+            $apiVersion   = "2023-05-01"
             $resourcePath = "/subscriptions/$sub/resourceGroups/$($env:RG)/providers/Microsoft.App/containerApps/$($env:APP)"
 
-            # Build the full ARM URI safely
+            # Build URI safely
             $ub = [System.UriBuilder]::new("https://management.azure.com$resourcePath")
-            $ub.Query = "api-version=$apiVersion"
-            $uri = $ub.Uri.AbsoluteUri
-
-            Write-Host "SUB:  $sub"
-            Write-Host "PATH: $resourcePath"
-            Write-Host "API : $apiVersion"
-            Write-Host "PATCHing Container App with image $($env:IMAGE)"
-            Write-Host "URI : $uri"
-
-            # Acquire ARM token using Az
-            $token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
-
-            # Container name from your aca-app.json
-            $containerName = "main"
-
-            # Minimal JSON Merge Patch body: only update the image
-            $body = @{
-              properties = @{
-                template = @{
-                  containers = @(
-                    @{
-                      name  = $containerName
-                      image = $env:IMAGE
-                    }
-                  )
-                }
-              }
-            } | ConvertTo-Json -Depth 100
-
-            $headers = @{ "Authorization" = "Bearer $token" }
-            $resp = Invoke-RestMethod -Method PATCH -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body -ErrorAction Stop
-
-            # Some PSGallery builds don’t populate StatusCode; do a GET to verify success
-            Write-Host "PATCH submitted. Verifying with a GET…"
-            $get = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
-            if (-not $get.properties) { throw "PATCH verification failed: no properties returned." }
-
-      
       
       - name: Wait for revision to become Ready
         uses: azure/powershell@v1
