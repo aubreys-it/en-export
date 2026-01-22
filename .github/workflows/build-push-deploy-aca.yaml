@@ -49,16 +49,29 @@ jobs:
             Connect-AzContainerRegistry -Name $env:ACR_NAME
       # Connect-AzContainerRegistry sets Docker creds to push/pull. [1](https://dev.to/latzo/automating-azure-project-setup-with-powershell-and-github-actions-572f)
 
-      - name: Build & Push image (Docker)
-        run: |
-          TAG=$(date +'%Y%m%d-%H%M')
-          IMAGE="${{ steps.get_acr_login_server.outputs.loginServer }}/en-export-func:${TAG}"
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
-          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-        id: build_push
-        env:
-          get_acr_login_server: ${{ steps.Get_ACR_login_server.outputs.loginServer }}
+      - name: Build & Push image (single-step version)
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "10.0"
+          inlineScript: |
+            $acr = Get-AzContainerRegistry -ResourceGroupName $env:RG -Name $env:ACR_NAME
+            $loginServer = $acr.LoginServer
+            $tag = (Get-Date -Format 'yyyyMMdd-HHmm')
+            $image = "$loginServer/en-export-func:$tag"
+            Write-Host "Building $image"
+            docker build -t "$image" .
+            docker push "$image"
+      
+      #- name: Build & Push image (Docker)
+      #  run: |
+      #    TAG=$(date +'%Y%m%d-%H%M')
+      #    IMAGE="${{ steps.get_acr_login_server.outputs.loginServer }}/en-export-func:${TAG}"
+      #    docker build -t "$IMAGE" .
+      #    docker push "$IMAGE"
+      #    echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+      #  id: build_push
+      #  env:
+      #    get_acr_login_server: ${{ steps.Get_ACR_login_server.outputs.loginServer }}
 
       # (Optional) Ensure Dapr Cron component is present/up-to-date (scoped to $APP)
       # Requires cron-dapr.yaml in repo; comment out if you manage this outside CI.
