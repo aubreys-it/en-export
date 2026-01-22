@@ -86,16 +86,59 @@ jobs:
       #       # Dapr components are environment resources; 'scopes' should include $env:APP. [3](https://github.com/Azure/azure-cli/issues/25829)
       #       Write-Host "Skipping cron component enforcement in this run."
 
-      - name: Update ACA app to new image (ARM + Az PowerShell)
+      #- name: Update ACA app to new image (ARM + Az PowerShell)
+      #  uses: azure/powershell@v1
+      #  with:
+      #    azPSVersion: "10.0"
+      #    inlineScript: |
+      #      New-AzResourceGroupDeployment `
+      #        -ResourceGroupName $env:RG `
+      #        -TemplateFile ./aca-app.json `
+      #        -envName $env:ENV `
+      #        -appName $env:APP `
+      #        -image $env:IMAGE `
+      #        -acrServer $env:ACR_SERVER `
+      #        -ingress "internal"
+      
+      - name: Update image via ARM PUT (Az REST)
         uses: azure/powershell@v1
         with:
           azPSVersion: "10.0"
           inlineScript: |
-            New-AzResourceGroupDeployment `
-              -ResourceGroupName $env:RG `
-              -TemplateFile ./aca-app.json `
-              -envName $env:ENV `
-              -appName $env:APP `
-              -image $env:IMAGE `
-              -acrServer $env:ACR_SERVER `
-              -ingress "internal"
+            if (-not $env:IMAGE) { throw "IMAGE is not set." }
+            $sub = (Get-AzContext).Subscription.Id
+            $rid = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP?api-version=2023-05-01"
+
+            # GET current app
+            $app = (Invoke-AzRest -Method GET -Path $rid).Content | ConvertFrom-Json
+
+            # (Optional) ensure registries and MI identity are present if your template doesn’t set them
+            # $app.identity.type = "SystemAssigned" # only if it wasn't set by template
+
+            # Update the image
+            $app.properties.template.containers[0].image = $env:IMAGE
+            $body = $app | ConvertTo-Json -Depth 100
+
+            Write-Host "Updating Container App with image $($env:IMAGE)"
+            $resp = Invoke-AzRest -Method PUT -Path $rid -Payload $body
+            if ($resp.StatusCode -notin 200,201,202) { throw "Failed to update app: $($resp.Content)" }
+
+      - name: Wait for revision to become Ready
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "10.0"
+          inlineScript: |
+            $sub = (Get-AzContext).Subscription.Id
+            $rid = "/subscriptions/$sub/resourceGroups/$env:RG/providers/Microsoft.App/containerApps/$env:APP?api-version=2023-05-01"
+
+            $deadline = (Get-Date).AddMinutes(10)  # adjust if your image is big
+            do {
+              Start-Sleep -Seconds 10
+              $app = (Invoke-AzRest -Method GET -Path $rid).Content | ConvertFrom-Json
+              $rev = $app.properties.latestRevisionName
+              $activeRevisions = $app.properties.revisions | Where-Object { $_.name -eq $rev }
+              $state = $activeRevisions.properties.active ? $activeRevisions.properties.provisioningState : "Provisioning"
+              Write-Host "Latest Revision: $rev  State: $state"
+              if ((Get-Date) -gt $deadline) { throw "Timeout waiting for revision to become Ready." }
+            } while ($state -ne "Succeeded")
+``
