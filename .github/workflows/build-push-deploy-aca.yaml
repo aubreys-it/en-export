@@ -87,7 +87,8 @@ jobs:
             # Build URI safely
             $ub = [System.UriBuilder]::new("https://management.azure.com$resourcePath")
       
-      - name: Wait for revision to become Ready (Azure CLI, resilient)
+      
+      - name: Wait for image to be applied and app to become Ready (Azure CLI)
         shell: bash
         env:
           SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
@@ -96,60 +97,83 @@ jobs:
 
           APP="${APP:?APP env is required}"
           RG="${RG:?RG env is required}"
+          DESIRED_IMAGE="${IMAGE:?IMAGE env is required}"
 
-          # Ensure CLI is pointing at the right subscription
           az account set --subscription "$SUBSCRIPTION_ID"
 
-          # --- 1) Resolve a revision name (retry for up to 3 minutes) ---
-          echo "Resolving revision name to wait on..."
-          RESOLVE_DEADLINE=$((SECONDS + 180))
-          REV=""
+          echo "Target image: $DESIRED_IMAGE"
+          echo "Verifying the app reflects the target image in its template..."
 
-          while [ -z "${REV}" ] || [ "${REV}" = "None" ]; do
-            # Try the app's latestRevisionName first
-            REV="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestRevisionName -o tsv || true)"
-
-            if [ -z "${REV}" ] || [ "${REV}" = "None" ]; then
-              # Fall back to listing revisions; pick the newest by createdTime
-              REV="$(az containerapp revision list -n "$APP" -g "$RG" \
-                      --query "max_by([].{n:name, t:properties.createdTime}, &t).n" -o tsv || true)"
-            fi
-
-            if [ -z "${REV}" ] || [ "${REV}" = "None" ]; then
-              if [ $SECONDS -gt $RESOLVE_DEADLINE ]; then
-                echo "ERROR: Could not resolve a revision to wait on (latestRevisionName empty and list returned none)."
-                echo "App (raw):"
-                az containerapp show -n "$APP" -g "$RG" -o json || true
-                echo "Revisions (raw):"
-                az containerapp revision list -n "$APP" -g "$RG" -o json || true
-                exit 1
-              fi
-              echo "Revision not visible yet. Sleeping 5s and retrying..."
-              sleep 5
-            fi
-          done
-
-          echo "Resolved revision: $REV"
-
-          # --- 2) Poll that specific revision's provisioningState ---
-          DEADLINE=$((SECONDS + 600))   # 10 minutes max; adjust if your image is large
+          # --- Phase 1: Wait until the app template shows the desired image ---
+          DEADLINE_IMAGE=$((SECONDS + 300))  # 5 minutes max to see image applied
           while true; do
-            STATE="$(az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" \
-                      --query properties.provisioningState -o tsv || true)"
-            RUNNING="$(az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" \
-                      --query properties.runningStatus -o tsv || true)"
+            CURRENT_IMAGE="$(az containerapp show -n "$APP" -g "$RG" --query properties.template.containers[0].image -o tsv || true)"
+            PS="$(az containerapp show -n "$APP" -g "$RG" --query properties.provisioningState -o tsv || true)"
+            echo "Current template image: ${CURRENT_IMAGE:-<none>} | provisioningState=${PS:-<unknown>}"
 
-            echo "Revision $REV  provisioningState=${STATE:-<unknown>}  runningStatus=${RUNNING:-<unknown>}"
-
-            if [ "$STATE" = "Succeeded" ]; then
-              echo "Revision $REV is Ready."
+            if [ "$CURRENT_IMAGE" = "$DESIRED_IMAGE" ]; then
+              echo "The desired image is now in the app template."
               break
             fi
 
-            if [ $SECONDS -gt $DEADLINE ]; then
-              echo "ERROR: Timeout waiting for revision $REV to become Ready."
-              echo "Dumping revision details for diagnostics:"
-              az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" -o json || true
+            if [ "$PS" = "Failed" ] && [ $SECONDS -gt $((DEADLINE_IMAGE - 240)) ]; then
+              # If we already see Failed and we are well into the wait, fail faster with diagnostics
+              echo "ERROR: App provisioningState=Failed while waiting for image to apply."
+              az containerapp show -n "$APP" -g "$RG" -o json || true
+              exit 1
+            fi
+
+            if [ $SECONDS -gt $DEADLINE_IMAGE ]; then
+              echo "ERROR: Timed out waiting for template image to become $DESIRED_IMAGE."
+              echo "App (raw):"
+              az containerapp show -n "$APP" -g "$RG" -o json || true
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          # --- Phase 2: Wait for app to return to a healthy state or a ready revision to appear ---
+          echo "Waiting for the app to become Ready (Succeeded) or to expose a ready revision..."
+
+          DEADLINE_READY=$((SECONDS + 600))  # 10 minutes
+          while true; do
+            PS="$(az containerapp show -n "$APP" -g "$RG" --query properties.provisioningState -o tsv || true)"
+            LRN="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestReadyRevisionName -o tsv || true)"
+            LSN="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestRevisionName -o tsv || true)"
+
+            echo "provisioningState=${PS:-<unknown>} | latestReadyRevisionName=${LRN:-<none>} | latestRevisionName=${LSN:-<none>}"
+
+            if [ "$PS" = "Succeeded" ] || [ -n "$LRN" ] && [ "$LRN" != "None" ]; then
+              echo "App is Ready."
+              break
+            fi
+
+            # As a fallback, if a revision exists, check its provisioningState
+            REV="$(az containerapp revision list -n "$APP" -g "$RG" \
+                  --query "max_by([].{n:name, t:properties.createdTime}, &t).n" -o tsv || true)"
+            if [ -n "$REV" ] && [ "$REV" != "None" ]; then
+              RSTATE="$(az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" \
+                      --query properties.provisioningState -o tsv || true)"
+              echo "Newest revision ${REV} state: ${RSTATE:-<unknown>}"
+              if [ "$RSTATE" = "Succeeded" ]; then
+                echo "Newest revision is Ready."
+                break
+              fi
+            fi
+
+            if [ "$PS" = "Failed" ] && [ $SECONDS -gt $((DEADLINE_READY - 540)) ]; then
+              echo "ERROR: App provisioningState=Failed during readiness wait. Dumping details:"
+              az containerapp show -n "$APP" -g "$RG" -o json || true
+              exit 1
+            fi
+
+            if [ $SECONDS -gt $DEADLINE_READY ]; then
+              echo "ERROR: Timeout waiting for the app to become Ready."
+              echo "App (raw):"
+              az containerapp show -n "$APP" -g "$RG" -o json || true
+              echo "Revisions (raw):"
+              az containerapp revision list -n "$APP" -g "$RG" -o json || true
               exit 1
             fi
 
