@@ -87,7 +87,7 @@ jobs:
             # Build URI safely
             $ub = [System.UriBuilder]::new("https://management.azure.com$resourcePath")
       
-      - name: Wait for revision to become Ready (Azure CLI)
+      - name: Wait for revision to become Ready (Azure CLI, resilient)
         shell: bash
         env:
           SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
@@ -97,29 +97,61 @@ jobs:
           APP="${APP:?APP env is required}"
           RG="${RG:?RG env is required}"
 
-          # Always run CLI in the right subscription (azure/login configured CLI session already)
+          # Ensure CLI is pointing at the right subscription
           az account set --subscription "$SUBSCRIPTION_ID"
 
-          # Helper to get a field cleanly (tsv -> trimmed)
-          jget() { jq -r "$1"; }
+          # --- 1) Resolve a revision name (retry for up to 3 minutes) ---
+          echo "Resolving revision name to wait on..."
+          RESOLVE_DEADLINE=$((SECONDS + 180))
+          REV=""
 
-          echo "Resolving latest revision name..."
-          REV="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestRevisionName -o tsv || true)"
+          while [ -z "${REV}" ] || [ "${REV}" = "None" ]; do
+            # Try the app's latestRevisionName first
+            REV="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestRevisionName -o tsv || true)"
 
-          if [ -z "$REV" ] || [ "$REV" = "None" ]; then
-            echo "latestRevisionName empty; falling back to revisions list..."
-            # Pick the most recently created revision
-            REV="$(az containerapp revision list -n "$APP" -g "$RG" \
-                    --query "max_by([].{n:name, t:properties.createdTime}, &t).n" -o tsv)"
-            if [ -z "$REV" ] || [ "$REV" = "None" ]; then
-              echo "ERROR: Could not resolve a revision to wait on."
-              exit 1
+            if [ -z "${REV}" ] || [ "${REV}" = "None" ]; then
+              # Fall back to listing revisions; pick the newest by createdTime
+              REV="$(az containerapp revision list -n "$APP" -g "$RG" \
+                      --query "max_by([].{n:name, t:properties.createdTime}, &t).n" -o tsv || true)"
             fi
-          fi
 
-          echo "Waiting on revision: $REV"
+            if [ -z "${REV}" ] || [ "${REV}" = "None" ]; then
+              if [ $SECONDS -gt $RESOLVE_DEADLINE ]; then
+                echo "ERROR: Could not resolve a revision to wait on (latestRevisionName empty and list returned none)."
+                echo "App (raw):"
+                az containerapp show -n "$APP" -g "$RG" -o json || true
+                echo "Revisions (raw):"
+                az containerapp revision list -n "$APP" -g "$RG" -o json || true
+                exit 1
+              fi
+              echo "Revision not visible yet. Sleeping 5s and retrying..."
+              sleep 5
+            fi
+          done
 
-          # Poll provisioningState until Succeeded (10 min timeout)
-          DEADLINE=$((SECONDS + 600))
+          echo "Resolved revision: $REV"
+
+          # --- 2) Poll that specific revision's provisioningState ---
+          DEADLINE=$((SECONDS + 600))   # 10 minutes max; adjust if your image is large
           while true; do
             STATE="$(az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" \
+                      --query properties.provisioningState -o tsv || true)"
+            RUNNING="$(az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" \
+                      --query properties.runningStatus -o tsv || true)"
+
+            echo "Revision $REV  provisioningState=${STATE:-<unknown>}  runningStatus=${RUNNING:-<unknown>}"
+
+            if [ "$STATE" = "Succeeded" ]; then
+              echo "Revision $REV is Ready."
+              break
+            fi
+
+            if [ $SECONDS -gt $DEADLINE ]; then
+              echo "ERROR: Timeout waiting for revision $REV to become Ready."
+              echo "Dumping revision details for diagnostics:"
+              az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" -o json || true
+              exit 1
+            fi
+
+            sleep 10
+          done
