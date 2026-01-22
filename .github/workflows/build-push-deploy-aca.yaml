@@ -63,7 +63,7 @@ jobs:
             docker push "$image"
             "IMAGE=$image" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "ACR_SERVER=$loginServer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            
+
       - name: Update image via ARM PATCH (az rest)
         shell: bash
         env:
@@ -99,95 +99,157 @@ jobs:
             echo "WARNING: Template image not updated yet; the wait step will check again."
           fi
 
+      - name: Upgrade Container Apps CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          az upgrade -y || true
+          az extension add -n containerapp --upgrade -y || true
 
-      - name: Wait for image to be applied and app to become Ready (Azure CLI)
+          
+      # Re-issue the PATCH using the latest API (idempotent) and capture previous revision
+      - name: Ensure image is patched via ARM (latest API)
         shell: bash
         env:
           SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         run: |
           set -euo pipefail
-
-          APP="${APP:?APP env is required}"
-          RG="${RG:?RG env is required}"
-          DESIRED_IMAGE="${IMAGE:?IMAGE env is required}"
-
           az account set --subscription "$SUBSCRIPTION_ID"
 
-          echo "Target image: $DESIRED_IMAGE"
-          echo "Verifying the app reflects the target image in its template..."
+          API="2025-07-01" # latest documented Container Apps Update API
+          APP_ID=$(az containerapp show -n "$APP" -g "$RG" --query id -o tsv)
+          URL="https://management.azure.com${APP_ID}?api-version=${API}"
 
-          # --- Phase 1: Wait until the app template shows the desired image ---
-          DEADLINE_IMAGE=$((SECONDS + 300))  # 5 minutes max to see image applied
-          while true; do
-            CURRENT_IMAGE="$(az containerapp show -n "$APP" -g "$RG" --query properties.template.containers[0].image -o tsv || true)"
-            PS="$(az containerapp show -n "$APP" -g "$RG" --query properties.provisioningState -o tsv || true)"
-            echo "Current template image: ${CURRENT_IMAGE:-<none>} | provisioningState=${PS:-<unknown>}"
+          PREV_REV=$(az containerapp show -n "$APP" -g "$RG" --query properties.latestRevisionName -o tsv || echo "")
+          echo "PREV_REV=$PREV_REV" >> $GITHUB_ENV
 
-            if [ "$CURRENT_IMAGE" = "$DESIRED_IMAGE" ]; then
-              echo "The desired image is now in the app template."
+          # PATCH just the image (JSON Merge Patch)
+          BODY=$(jq -n --arg img "$IMAGE" --arg name "main" \
+            '{properties:{template:{containers:[{name:$name,image:$img}]}}}')
+          az rest --method patch --url "$URL" \
+            --headers "Content-Type=application/json" \
+            --body "$BODY" --output none
+
+            
+      # Robust wait: confirm template updates, then find the matching revision, then wait on its health
+      - name: Wait for image to apply and revision to become Healthy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_IMG="$IMAGE"
+          echo "🔎 Target image: $TARGET_IMG"
+
+          # 1) Wait for the app template to reflect the target image (eventual consistency)
+          MAX_TRIES=24  # ~2m @5s
+          SLEEP=5
+          TEMPLATE_OK=""
+          for i in $(seq 1 $MAX_TRIES); do
+            CUR_IMG=$(az containerapp show -n "$APP" -g "$RG" --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "")
+            APP_STATE=$(az containerapp show -n "$APP" -g "$RG" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "")
+            echo "Template check $i/$MAX_TRIES: image='$CUR_IMG' | app.provisioningState='$APP_STATE'"
+            if [[ "$CUR_IMG" == "$TARGET_IMG" ]]; then
+              TEMPLATE_OK="yes"; break
+            fi
+            sleep $SLEEP
+          done
+
+          # If still not reflected, retry PATCH once (handles missed write/race) and wait again quickly
+          if [[ -z "$TEMPLATE_OK" ]]; then
+            echo "⚠️ Template hasn't reflected image yet. Re-issuing PATCH once."
+            API="2025-07-01"
+            APP_ID=$(az containerapp show -n "$APP" -g "$RG" --query id -o tsv)
+            URL="https://management.azure.com${APP_ID}?api-version=${API}"
+            BODY=$(jq -n --arg img "$TARGET_IMG" --arg name "main" \
+              '{properties:{template:{containers:[{name:$name,image:$img}]}}}')
+            az rest --method patch --url "$URL" \
+              --headers "Content-Type=application/json" \
+              --body "$BODY" --output none
+            for i in $(seq 1 12); do
+              CUR_IMG=$(az containerapp show -n "$APP" -g "$RG" --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "")
+              echo "Re-check template ($i/12): '$CUR_IMG'"
+              [[ "$CUR_IMG" == "$TARGET_IMG" ]] && { TEMPLATE_OK="yes"; break; }
+              sleep 5
+            done
+          fi
+
+          if [[ -z "$TEMPLATE_OK" ]]; then
+            echo "❌ Template never reflected target image '$TARGET_IMG'."
+            echo "Dumping app JSON for context:"
+            az containerapp show -n "$APP" -g "$RG" -o jsonc || true
+            exit 1
+          fi
+
+          # 2) Find the new revision that references the target image
+          #    We cannot rely on app.provisioningState; we must find and wait on the revision itself.
+          #    (CLI docs: 'az containerapp revision list/show') 
+          #    NOTE: list returns newest first in most cases; filter by image to be precise.
+          TARGET_REV=""
+          for i in $(seq 1 60); do
+            TARGET_REV=$(az containerapp revision list -n "$APP" -g "$RG" \
+              --query "[?properties.template.containers[0].image=='${TARGET_IMG}']|[0].name" -o tsv 2>/dev/null || echo "")
+            if [[ -n "$TARGET_REV" ]]; then
+              echo "✅ Found target revision: $TARGET_REV"
               break
             fi
-
-            if [ "$PS" = "Failed" ] && [ $SECONDS -gt $((DEADLINE_IMAGE - 240)) ]; then
-              # If we already see Failed and we are well into the wait, fail faster with diagnostics
-              echo "ERROR: App provisioningState=Failed while waiting for image to apply."
-              az containerapp show -n "$APP" -g "$RG" -o json || true
-              exit 1
-            fi
-
-            if [ $SECONDS -gt $DEADLINE_IMAGE ]; then
-              echo "ERROR: Timed out waiting for template image to become $DESIRED_IMAGE."
-              echo "App (raw):"
-              az containerapp show -n "$APP" -g "$RG" -o json || true
-              exit 1
-            fi
-
+            echo "⏳ Waiting for target revision to appear ($i/60)..."
             sleep 5
           done
 
-          # --- Phase 2: Wait for app to return to a healthy state or a ready revision to appear ---
-          echo "Waiting for the app to become Ready (Succeeded) or to expose a ready revision..."
+          if [[ -z "$TARGET_REV" ]]; then
+            echo "❌ No revision found with image '$TARGET_IMG'. Revisions snapshot:"
+            az containerapp revision list -n "$APP" -g "$RG" -o table || true
+            exit 1
+          fi
 
-          DEADLINE_READY=$((SECONDS + 600))  # 10 minutes
-          while true; do
-            PS="$(az containerapp show -n "$APP" -g "$RG" --query properties.provisioningState -o tsv || true)"
-            LRN="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestReadyRevisionName -o tsv || true)"
-            LSN="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestRevisionName -o tsv || true)"
+          # 3) Wait for the revision to be Ready / Healthy
+          #    We check provisioningState, healthState and runningState.
+          #    If it fails, dump logs to help diagnose (pull errors, probe failures, etc).
+          MAX_TRIES=90  # up to ~7.5m @5s
+          SLEEP=5
+          READY=""
+          for i in $(seq 1 $MAX_TRIES); do
+            REV_JSON=$(az containerapp revision show -n "$APP" -g "$RG" --revision "$TARGET_REV" -o json 2>/dev/null || echo "{}")
+            PROV=$(echo "$REV_JSON" | jq -r '.properties.provisioningState // empty')
+            HEALTH=$(echo "$REV_JSON" | jq -r '.properties.healthState // empty')
+            RUNSTATE=$(echo "$REV_JSON" | jq -r '.properties.runningState // empty')
 
-            echo "provisioningState=${PS:-<unknown>} | latestReadyRevisionName=${LRN:-<none>} | latestRevisionName=${LSN:-<none>}"
+            echo "Revision $TARGET_REV status ($i/$MAX_TRIES): provisioning=$PROV | health=$HEALTH | runningState=$RUNSTATE"
 
-            if [ "$PS" = "Succeeded" ] || [ -n "$LRN" ] && [ "$LRN" != "None" ]; then
-              echo "App is Ready."
-              break
+            if [[ "$PROV" == "Succeeded" && "$HEALTH" == "Healthy" && "$RUNSTATE" =~ ^(Running|RunningAtMaxScale)$ ]]; then
+              READY="yes"; break
             fi
 
-            # As a fallback, if a revision exists, check its provisioningState
-            REV="$(az containerapp revision list -n "$APP" -g "$RG" \
-                  --query "max_by([].{n:name, t:properties.createdTime}, &t).n" -o tsv || true)"
-            if [ -n "$REV" ] && [ "$REV" != "None" ]; then
-              RSTATE="$(az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" \
-                      --query properties.provisioningState -o tsv || true)"
-              echo "Newest revision ${REV} state: ${RSTATE:-<unknown>}"
-              if [ "$RSTATE" = "Succeeded" ]; then
-                echo "Newest revision is Ready."
-                break
-              fi
-            fi
-
-            if [ "$PS" = "Failed" ] && [ $SECONDS -gt $((DEADLINE_READY - 540)) ]; then
-              echo "ERROR: App provisioningState=Failed during readiness wait. Dumping details:"
-              az containerapp show -n "$APP" -g "$RG" -o json || true
+            # Immediate failure path
+            if [[ "$PROV" == "Failed" || "$HEALTH" =~ ^(Failed|Degraded)$ ]]; then
+              echo "❌ Revision indicates failure. Fetching logs…"
+              az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --type system --tail 200 --format text || true
+              az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --tail 200 --format text || true
+              echo "Revisions snapshot:"
+              az containerapp revision list -n "$APP" -g "$RG" -o table || true
               exit 1
             fi
 
-            if [ $SECONDS -gt $DEADLINE_READY ]; then
-              echo "ERROR: Timeout waiting for the app to become Ready."
-              echo "App (raw):"
-              az containerapp show -n "$APP" -g "$RG" -o json || true
-              echo "Revisions (raw):"
-              az containerapp revision list -n "$APP" -g "$RG" -o json || true
-              exit 1
-            fi
-
-            sleep 10
+            sleep $SLEEP
           done
+
+          if [[ -z "$READY" ]]; then
+            echo "❌ Timed out waiting for revision $TARGET_REV to become Healthy."
+            echo "Dumping recent logs to help diagnose:"
+            az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --type system --tail 200 --format text || true
+            az containerapp logs show -n "$APP" -g "$RG" --revision "$TARGET_REV" --tail 200 --format text || true
+            exit 1
+          fi
+
+          # 4) In Single revision mode, confirm the latestReadyRevisionName matches the target 
+          LATEST_READY=$(az containerapp show -n "$APP" -g "$RG" --query properties.latestReadyRevisionName -o tsv || echo "")
+          echo "latestReadyRevisionName: $LATEST_READY"
+          if [[ -n "$LATEST_READY" && "$LATEST_READY" != "$TARGET_REV" ]]; then
+            echo "⚠️ App has a different latestReadyRevisionName ($LATEST_READY) than target ($TARGET_REV)."
+            echo "Traffic may still be switching; continuing since target is Healthy."
+          fi
+
+          echo "✅ Deployment succeeded: $TARGET_REV is Healthy and running."
+
+
+      
