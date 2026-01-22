@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "envName":  { "type": "string" },
+    "appName":  { "type": "string" },
+    "image":    { "type": "string" },
+    "targetPort": { "type": "int", "defaultValue": 8080 },
+    "ingress":  { "type": "string", "defaultValue": "internal" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('appName')]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('envName'))]",
+        "configuration": {
+          "ingress": {
+            "external": "[equals(parameters('ingress'),'external')]",
+            "targetPort": "[parameters('targetPort')]"
+          },
+          "dapr": {
+            "enabled": true,
+            "appId": "[parameters('appName')]",
+            "appPort": "[parameters('targetPort')]"
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "main",
+              "image": "[parameters('image')]",
+              "resources": {
+                "cpu": 0.25,
+                "memory": "0.5Gi"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "resources": [
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('envName')]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[parameters('logAnalyticsId')]",
+            "sharedKey": "[parameters('logAnalyticsKey')]"
+          }
+        }
+      }
+    }
+  ],
+  "parameters": {
+    "envName": { "type": "string" },
+    "logAnalyticsId": { "type": "string", "defaultValue": "" },
+    "logAnalyticsKey": { "type": "string", "defaultValue": "" }
+  }
+}

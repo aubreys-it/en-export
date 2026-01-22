@@ -1,0 +1,30 @@
+
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "envName": { "type": "string" },
+    "componentName": { "type": "string", "defaultValue": "daily-cron" },
+    "scopedAppId": { "type": "string" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/managedEnvironments/daprComponents",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/{1}', parameters('envName'), parameters('componentName'))]",
+      "properties": {
+        "componentType": "bindings.cron",
+        "version": "v1",
+        "metadata": [
+          {
+            "name": "schedule",
+            "value": "CRON_TZ=UTC 0 4 * * *"
+          }
+        ],
+        "scopes": [
+          "[parameters('scopedAppId')]"
+        ]
+      }
+    }
+  ]
+}
